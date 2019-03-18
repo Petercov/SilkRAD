@@ -15,7 +15,7 @@ namespace RayTracer {
             const float3& startPos, const float3& endPos
             ) {
 
-        const float EPSILON = 1e-6;
+        const float EPSILON = 1e-6f;
 
         float3 diff = endPos - startPos;
         float dist = len(diff);
@@ -35,7 +35,7 @@ namespace RayTracer {
         float3 tVec = startPos - vertex1;
 
         float u = dot(tVec, pVec);
-        if (u < 0.0 || u > det) {
+        if (u < 0.0f || u > det) {
             return false;
         }
 
@@ -43,13 +43,13 @@ namespace RayTracer {
 
         float v = dot(dir, qVec);
 
-        if (v < 0.0 || u + v > det) {
+        if (v < 0.0f || u + v > det) {
             return false;
         }
 
         float t = dot(edge2, qVec) / det;
 
-        return (0.0 < t && t < dist);
+        return (0.0f < t && t < dist);
     }
 
     /**
@@ -63,17 +63,19 @@ namespace RayTracer {
             return;
         }
 
-        Triangle& tri = triangles[index];
+        const float EPSILON = 1e-3f;
 
-        const float EPSILON = 1e-3;
+        Triangle& tri = triangles[index];
 
         float3& vertex1 = tri.vertices[0];
         float3& vertex2 = tri.vertices[1];
         float3& vertex3 = tri.vertices[2];
 
-        vertex1 += normalized(vertex1 - 0.5 * (vertex2 + vertex3)) * EPSILON;
-        vertex2 += normalized(vertex2 - 0.5 * (vertex1 + vertex3)) * EPSILON;
-        vertex3 += normalized(vertex3 - 0.5 * (vertex1 + vertex2)) * EPSILON;
+        float3 center = (vertex1 + vertex2 + vertex3) / 3.0f;
+
+        vertex1 += normalized(vertex1 - center) * EPSILON;
+        vertex2 += normalized(vertex2 - center) * EPSILON;
+        vertex3 += normalized(vertex3 - center) * EPSILON;
     }
 
     static const size_t MAX_DEPTH = 10;
@@ -83,7 +85,7 @@ namespace RayTracer {
             KDNode* nodes,
             size_t depth
             ) {
-            
+
         //printf("Split nodes (depth %u)...\n", static_cast<unsigned int>(depth));
 
         KDNode& node = nodes[threadIdx.x];
@@ -93,7 +95,7 @@ namespace RayTracer {
             //    "Found a leaf! (%u tris)\n",
             //    static_cast<unsigned int>(node.numTris)
             //);
-            node.type = NODETYPE_LEAF;
+            node.type = KDNodeType::LEAF;
             return;
         }
 
@@ -114,9 +116,9 @@ namespace RayTracer {
             /* Split along the x-axis. */
 
             nodeSize.x *= 0.5;
-            node.axis = AXIS_X;
+            node.axis = Axis::X;
             node.pos = node.tmin.x + nodeSize.x;
-            rightTMin = node.tmin + make_float3(nodeSize.x, 0.0, 0.0);
+            rightTMin = node.tmin + make_float3(nodeSize.x, 0.0f, 0.0f);
 
             //printf(
             //    "(%u) Split at x = %f\n",
@@ -132,9 +134,9 @@ namespace RayTracer {
             /* Split along the y-axis. */
 
             nodeSize.y *= 0.5;
-            node.axis = AXIS_Y;
+            node.axis = Axis::Y;
             node.pos = node.tmin.y + nodeSize.y;
-            rightTMin = node.tmin + make_float3(0.0, nodeSize.y, 0.0);
+            rightTMin = node.tmin + make_float3(0.0f, nodeSize.y, 0.0f);
 
             //printf(
             //    "(%u) Split at y = %f\n",
@@ -145,9 +147,9 @@ namespace RayTracer {
         else {
             /* Split along the z-axis. */
             nodeSize.z *= 0.5;
-            node.axis = AXIS_Z;
+            node.axis = Axis::Z;
             node.pos = node.tmin.z + nodeSize.z;
-            rightTMin = node.tmin + make_float3(0.0, 0.0, nodeSize.z);
+            rightTMin = node.tmin + make_float3(0.0f, 0.0f, nodeSize.z);
             //printf(
             //    "(%u) Split at z = %f\n",
             //    static_cast<unsigned int>(depth),
@@ -159,7 +161,7 @@ namespace RayTracer {
         CUDA_CHECK_ERROR_DEVICE(
             cudaMalloc(&leftTriIDs, sizeof(size_t) * node.numTris)
         );
-        
+
         size_t* rightTriIDs;
         CUDA_CHECK_ERROR_DEVICE(
             cudaMalloc(&rightTriIDs, sizeof(size_t) * node.numTris)
@@ -177,17 +179,17 @@ namespace RayTracer {
 
             for (int vertex=0; vertex<3; vertex++) {
                 switch (node.axis) {
-                    case AXIS_X:
+                    case Axis::X:
                         if (tri.vertices[vertex].x <= node.pos) {
                             onLeft = true;
                         }
                         if (tri.vertices[vertex].x >= node.pos) {
                             onRight = true;
                         }
-                        
+
                         break;
 
-                    case AXIS_Y:
+                    case Axis::Y:
                         if (tri.vertices[vertex].y <= node.pos) {
                             onLeft = true;
                         }
@@ -197,7 +199,7 @@ namespace RayTracer {
 
                         break;
 
-                    case AXIS_Z:
+                    case Axis::Z:
                         if (tri.vertices[vertex].z <= node.pos) {
                             onLeft = true;
                         }
@@ -230,13 +232,13 @@ namespace RayTracer {
             cudaMalloc(&node.children, sizeof(KDNode) * 2)
         );
 
-        node.children[0].type = NODETYPE_NODE;
+        node.children[0].type = KDNodeType::NODE;
         node.children[0].tmin = node.tmin;
         node.children[0].tmax = node.tmin + nodeSize;
         node.children[0].triangleIDs = leftTriIDs;
         node.children[0].numTris = numLeft;
 
-        node.children[1].type = NODETYPE_NODE;
+        node.children[1].type = KDNodeType::NODE;
         node.children[1].tmin = rightTMin;
         node.children[1].tmax = node.tmax;
         node.children[1].triangleIDs = rightTriIDs;
@@ -253,13 +255,13 @@ namespace RayTracer {
 
         CUDA_CHECK_ERROR_DEVICE(cudaFree(node.triangleIDs));
 
-        if (node.type == NODETYPE_NODE) {
+        if (node.type == KDNodeType::NODE) {
             KDNode* children = node.children;
 
             if (threadIdx.x == 0) {
                 CUDA_CHECK_ERROR_DEVICE(cudaFree(nodes));
             }
-            
+
             KERNEL_LAUNCH_DEVICE(
                 cleanup_nodes, 1, 2,
                 children
@@ -279,14 +281,14 @@ namespace RayTracer {
             m_triangleIDs(nullptr),
             m_numTriangles(0),
             m_pTreeRoot(nullptr),
-            m_tmin(make_float3(0.0, 0.0, 0.0)),
-            m_tmax(make_float3(0.0, 0.0, 0.0)) {}
+            m_tmin(make_float3()),
+            m_tmax(make_float3()) {}
 
     CUDARayTracer::~CUDARayTracer() {
         if (m_triangles != nullptr) {
             cudaFree(m_triangles);
         }
-        
+
         if (m_pTreeRoot != nullptr) {
             destroy_tree();
         }
@@ -294,8 +296,8 @@ namespace RayTracer {
 
     __host__ void CUDARayTracer::build_tree(void) {
         KDNode root;
-        
-        root.type = NODETYPE_NODE;
+
+        root.type = KDNodeType::NODE;
 
         root.tmin = m_tmin;
         root.tmax = m_tmax;
@@ -331,7 +333,7 @@ namespace RayTracer {
 
         CUDA_CHECK_ERROR(cudaFree(root.triangleIDs));
 
-        if (root.type == NODETYPE_NODE) {
+        if (root.type == KDNodeType::NODE) {
             KDNode* children = root.children;
 
             CUDA_CHECK_ERROR(cudaFree(m_pTreeRoot));
@@ -347,7 +349,7 @@ namespace RayTracer {
     __host__ void CUDARayTracer::add_triangles(
             const std::vector<Triangle>& tris
             ) {
-            
+
         // This method should only ever be called exactly once.
         assert(m_triangles == nullptr);
         assert(m_numTriangles == 0);
@@ -429,15 +431,15 @@ namespace RayTracer {
             const float3& startPos, const float3& endPos
             ) {
 
-        const float EPSILON = 1e-6;
+        const float EPSILON = 1e-6f;
 
         float3 dir = normalized(endPos - startPos);
         float3 invDir = make_float3(
-            1.0 / (dir.x + ((dir.x < 0) ? -EPSILON : EPSILON)),
-            1.0 / (dir.y + ((dir.y < 0) ? -EPSILON : EPSILON)),
-            1.0 / (dir.z + ((dir.z < 0) ? -EPSILON : EPSILON))
+            1.0f / (dir.x + ((dir.x < 0) ? -EPSILON : EPSILON)),
+            1.0f / (dir.y + ((dir.y < 0) ? -EPSILON : EPSILON)),
+            1.0f / (dir.z + ((dir.z < 0) ? -EPSILON : EPSILON))
         );
-        
+
         struct StackEntry {
             KDNode* pNode;
             float3 start;
@@ -455,7 +457,7 @@ namespace RayTracer {
 
         while (stackSize > 0) {
             if (stackSize >= 1024) {
-                printf("ALERT: Stack size too big!!!\n");
+                printf("ALERT: Raytracer stack size too big!!!\n");
                 return false;
             }
 
@@ -466,19 +468,19 @@ namespace RayTracer {
             float3 end = entry.end;
 
             float len = dist(start, end);
-            
+
             KDNode* children = pNode->children;
 
             float t;
 
             switch (pNode->type) {
-                case NODETYPE_LEAF:
+                case KDNodeType::LEAF:
                     for (size_t ti=0; ti<pNode->numTris; ti++) {
                         Triangle& tri = m_triangles[pNode->triangleIDs[ti]];
 
-                        // The M-T intersection algorithm uses CCW vertex 
-                        // winding, but Source uses CW winding. So, we need to 
-                        // pass the vertices in reverse order to get backface 
+                        // The M-T intersection algorithm uses CCW vertex
+                        // winding, but Source uses CW winding. So, we need to
+                        // pass the vertices in reverse order to get backface
                         // culling to work correctly.
                         bool isLOSBlocked = intersects(
                             tri.vertices[2], tri.vertices[1], tri.vertices[0],
@@ -492,23 +494,23 @@ namespace RayTracer {
 
                     break;
 
-                case NODETYPE_NODE:
+                case KDNodeType::NODE:
                     bool dirPositive;
 
                     switch (pNode->axis) {
-                        case AXIS_X:
+                        case Axis::X:
                             t = (pNode->pos - start.x) * invDir.x;
-                            dirPositive = dir.x >= 0.0;
+                            dirPositive = dir.x >= 0.0f;
                             break;
 
-                        case AXIS_Y:
+                        case Axis::Y:
                             t = (pNode->pos - start.y) * invDir.y;
-                            dirPositive = dir.y >= 0.0;
+                            dirPositive = dir.y >= 0.0f;
                             break;
 
-                        case AXIS_Z:
+                        case Axis::Z:
                             t = (pNode->pos - start.z) * invDir.z;
-                            dirPositive = dir.z >= 0.0;
+                            dirPositive = dir.z >= 0.0f;
                             break;
                     }
 
@@ -545,7 +547,7 @@ namespace RayTracer {
                             start,
                             clipPoint,
                         };
-                        
+
                         if (stackSize >= 1024) {
                             printf("ALERT: Stack size too big!!!\n");
                             return false;

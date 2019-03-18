@@ -1,4 +1,4 @@
-#include "cub/device/device_scan.cuh"
+#include "cub/cub.cuh"
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -7,19 +7,18 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <cassert>
 
 #include "cudarad.h"
 
 #include "bsp.h"
+#include "bsp_shared.h"
 
 #include "cudabsp.h"
 #include "cudamatrix.h"
 #include "raytracer.h"
 
 #include "cudautils.h"
-
-#define MAX_ITER 100
-#define PRECOMPUTE false
 
 
 namespace CUDARAD {
@@ -44,7 +43,7 @@ namespace CUDARAD {
             lightmapHeight(face.lightmapTextureSizeInLuxels[1] + 1),
             lightmapSize(lightmapWidth * lightmapHeight),
             lightmapStartIndex(face.lightOffset / sizeof(BSP::RGBExp32)),
-            totalLight(make_float3(0.0, 0.0, 0.0)) {}
+            totalLight(make_float3()) {}
 
     __device__ float3 FaceInfo::xyz_from_st(float s, float t) {
         float sOffset = this->texInfo.lightmapVecs[0][3];
@@ -82,12 +81,13 @@ namespace DirectLighting {
     __device__ float3 sample_at(
             CUDABSP::CUDABSP& cudaBSP,
             float3 samplePos,
-            float3 sampleNormal=make_float3(0.0, 0.0, 0.0)
+            float3 sampleNormal=make_float3()
             ) {
 
-        //samplePos += faceInfo.faceNorm * 1e-3;
+        uint8_t* pvs = CUDABSP::pvs_for_pos(cudaBSP, samplePos);
+        size_t numClusters = cudaBSP.numVisClusters;
 
-        float3 result = make_float3(0.0, 0.0, 0.0);
+        float3 result = make_float3();
 
         for (size_t lightIndex=0;
                  lightIndex<cudaBSP.numWorldLights;
@@ -96,34 +96,29 @@ namespace DirectLighting {
 
             BSP::DWorldLight& light = cudaBSP.worldLights[lightIndex];
 
-            float3 lightPos = make_float3(
-                light.origin.x,
-                light.origin.y,
-                light.origin.z
-            );
+            if (!CUDABSP::cluster_in_pvs(light.cluster, pvs, numClusters)) {
+                // This light isn't within the sample's PVS. Skip it.
+                continue;
+            }
 
+            float3 lightPos = make_float3(light.origin);
             float3 diff = samplePos - lightPos;
 
             /*
              * This light is on the wrong side of the current sample.
              * There's no way it could possibly light it.
              */
-            if (len(sampleNormal) > 0.0 && dot(diff, sampleNormal) >= 0.0) {
+            if (len(sampleNormal) > 0.0f && dot(diff, sampleNormal) >= 0.0f) {
                 continue;
             }
 
             float dist = len(diff);
             float3 dir = diff / dist;
 
-            float penumbraScale = 1.0;
+            float penumbraScale = 1.0f;
 
             if (light.type == BSP::EMIT_SPOTLIGHT) {
-                float3 lightNorm = make_float3(
-                    light.normal.x,
-                    light.normal.y,
-                    light.normal.z
-                );
-
+                float3 lightNorm = make_float3(light.normal);
                 float lightDot = dot(dir, lightNorm);
 
                 if (lightDot < light.stopdot2) {
@@ -156,7 +151,7 @@ namespace DirectLighting {
                 //}
             }
 
-            const float EPSILON = 1e-3;
+            const float EPSILON = 1e-3f;
 
             // Nudge the sample position towards the light slightly, to avoid
             // colliding with triangles that directly contain the sample
@@ -176,13 +171,8 @@ namespace DirectLighting {
             /* I CAN SEE THE LIGHT */
             float attenuation = attenuate(light, dist);
 
-            float3 lightContribution = make_float3(
-                light.intensity.x,  // r
-                light.intensity.y,  // g
-                light.intensity.z   // b
-            );
-
-            lightContribution *= penumbraScale * 255.0 / attenuation;
+            float3 lightContribution = make_float3(light.intensity);
+            lightContribution *= penumbraScale * 255.0f / attenuation;
 
             result += lightContribution;
         }
@@ -303,7 +293,7 @@ namespace DirectLighting {
 
 
 namespace AA {
-    static __device__ const float INV_GAMMA = 1.0 / 2.2;
+    static __device__ const float INV_GAMMA = 1.0f / 2.2f;
 
     static __device__ inline float perceptual_from_linear(float linear) {
         return powf(linear, INV_GAMMA);
@@ -312,201 +302,65 @@ namespace AA {
     static __device__ float intensity(float3 rgb) {
         return perceptual_from_linear(
             dot(
-                rgb / 255.0,
-                make_float3(1.0, 1.0, 1.0)
+                rgb / 255.0f,
+                make_float3(1.0f)
                 //make_float3(0.299, 0.587, 0.114)
             )
         );
     }
 
-    static __device__ const float MIN_AA_GRADIENT = 0.125;      // 1/8
-    //static __device__ const float MIN_AA_GRADIENT = 0.0625;    // 1/16
+    //static __device__ const float MIN_AA_GRADIENT = 1.0f / 8.0f;
+    static __device__ const float MIN_AA_GRADIENT = 1.0f / 16.0f;
 
-    __global__ void map_face_samples(
-            CUDABSP::CUDABSP* pCudaBSP,
-            /* output */ int* facesForSamples,
-            /* output */ int2* coordsForSamples
-            ) {
-
-        int faceIndex = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (faceIndex >= pCudaBSP->numFaces) {
-            return;
-        }
-
-        CUDARAD::FaceInfo faceInfo(*pCudaBSP, faceIndex);
-
-        for (size_t i=0; i<faceInfo.lightmapSize; i++) {
-            size_t sampleIndex = faceInfo.lightmapStartIndex + i;
-
-            facesForSamples[sampleIndex] = faceIndex;
-            coordsForSamples[sampleIndex] = make_int2(
-                i % faceInfo.lightmapWidth,
-                i / faceInfo.lightmapWidth
-            );
-        }
-    }
-
-    __global__ void map_select_targets(
-            CUDABSP::CUDABSP* pCudaBSP,
-            int* facesForSamples, int2* coordsForSamples,
-            /* output */ int* targets
-            ) {
-
-        size_t sampleIndex = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (sampleIndex >= pCudaBSP->numLightSamples) {
-            return;
-        }
-
-        int faceIndex = facesForSamples[sampleIndex];
-        int2 coords = coordsForSamples[sampleIndex];
-
-        if (faceIndex == -1 || coords.x == -1 || coords.y == -1) {
-            return;
-        }
-
-        int s = coords.x;
-        int t = coords.y;
-
-        CUDARAD::FaceInfo faceInfo(*pCudaBSP, faceIndex);
-
-        float3* samples = &pCudaBSP->lightSamples[faceInfo.lightmapStartIndex];
-
-        size_t width = faceInfo.lightmapWidth;
-        size_t height = faceInfo.lightmapHeight;
-
-        float3 sample = samples[t * width + s];
-
-        float gradient = 0.0;
-
-        for (int offsetT=-1; offsetT<=1; offsetT++) {
-            int neighborT = t + offsetT;
-
-            if (!(0 <= neighborT && neighborT < height)) {
-                continue;
-            }
-
-            for (int offsetS=-1; offsetS<=1; offsetS++) {
-                if (offsetS == 0 && offsetT == 0) {
-                    continue;
-                }
-
-                int neighborS = s + offsetS;
-
-                if (!(0 <= neighborS && neighborS < width)) {
-                    continue;
-                }
-
-                size_t neighborIndex = neighborT * width + neighborS;
-
-                float3 neighbor = samples[neighborIndex];
-
-                gradient = fmaxf(
-                    gradient,
-                    fabsf(intensity(neighbor) - intensity(sample))
-                );
-            }
-        }
-
-        targets[sampleIndex] = static_cast<int>(gradient >= MIN_AA_GRADIENT);
-    }
-
-    __global__ void gather_target_coords(
-            CUDABSP::CUDABSP* pCudaBSP,
-            /* output */ int2* finalCoords,
-            /* output */ int* finalFacesForCoords,
-            int2* coordsForSamples, int* facesForSamples,
-            int* targetsScanned, int* targets
-            ) {
-
-        size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (index >= pCudaBSP->numLightSamples) {
-            return;
-        }
-
-        if (targets[index]) {
-            size_t destIndex = targetsScanned[index] - 1;
-
-            finalCoords[destIndex] = coordsForSamples[index];
-            finalFacesForCoords[destIndex] = facesForSamples[index];
-        }
-    }
-
-    __global__ void antialias_coords(
-            CUDABSP::CUDABSP* pCudaBSP,
-            int2* coords, int* facesForCoords,
-            size_t numCoords
-            ) {
-
-        size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-
-        if (index >= numCoords) {
-            return;
-        }
-
-        int2 samplePos = coords[index];
-        size_t faceIndex = facesForCoords[index];
-
-        CUDARAD::FaceInfo faceInfo(*pCudaBSP, faceIndex);
-
-        int s = samplePos.x;
-        int t = samplePos.y;
-
-        /* Perform supersampling at this point. */
-        const size_t SUPERSAMPLE_WIDTH = 4;
-
-        float sStep = 2.0 / static_cast<float>(SUPERSAMPLE_WIDTH);
-        float tStep = 2.0 / static_cast<float>(SUPERSAMPLE_WIDTH);
-
-        float3 color = make_float3(0.0, 0.0, 0.0);
-
-        for (size_t ssi=0; ssi<SUPERSAMPLE_WIDTH; ssi++) {
-            float tOffset = tStep * ssi - 1.0;
-
-            for (size_t ssj=0; ssj<SUPERSAMPLE_WIDTH; ssj++) {
-                float sOffset = sStep * ssj - 1.0;
-
-                color += DirectLighting::sample_at(
-                    *pCudaBSP, faceInfo,
-                    s + sOffset, t + tOffset
-                );
-            }
-        }
-
-        color /= SUPERSAMPLE_WIDTH * SUPERSAMPLE_WIDTH;
-
-        size_t startIndex = faceInfo.lightmapStartIndex;
-        size_t sampleIndex = t * faceInfo.lightmapWidth + s;
-
-        pCudaBSP->lightSamples[startIndex + sampleIndex] = color;
-    }
+    const size_t MAP_FACES_AA_BLOCK_WIDTH = 16;
+    const size_t MAP_FACES_AA_BLOCK_HEIGHT = 16;
+    const size_t MAP_FACES_AA_NUM_THREADS =
+        MAP_FACES_AA_BLOCK_WIDTH * MAP_FACES_AA_BLOCK_HEIGHT;
 
     __global__ void map_faces_AA(CUDABSP::CUDABSP* pCudaBSP) {
-        bool primaryThread = (threadIdx.x == 0 && threadIdx.y == 0);
+        int threadID = threadIdx.y * blockDim.x + threadIdx.x;
+        bool primaryThread = (threadID == 0);
 
+        __shared__ size_t threadsPerBlock;
+
+        __shared__ size_t faceNum;
         __shared__ CUDARAD::FaceInfo faceInfo;
 
         __shared__ size_t lightmapStart;
         __shared__ size_t width;
         __shared__ size_t height;
 
-        //__shared__ float3* results;
+        __shared__ uint32_t aaTargets[CUDABSP::MAX_LUXELS_PER_FACE];
 
         if (primaryThread) {
+            threadsPerBlock = blockDim.x * blockDim.y;
+
             // Map block numbers to faces.
-            faceInfo = CUDARAD::FaceInfo(*pCudaBSP, blockIdx.x);
+            faceNum = blockIdx.x;
+            faceInfo = CUDARAD::FaceInfo(*pCudaBSP, faceNum);
 
             lightmapStart = faceInfo.lightmapStartIndex;
             width = faceInfo.lightmapWidth;
             height = faceInfo.lightmapHeight;
-
-            //results = new float3[width * height];
         }
 
         __syncthreads();
 
+        assert(width * height <= CUDABSP::MAX_LUXELS_PER_FACE);
+
+        /* Initialize the AA targets array. */
+        for (size_t i=0; i<CUDABSP::MAX_LUXELS_PER_FACE; i+=threadsPerBlock) {
+            size_t index = i + threadID;
+            if (index >= CUDABSP::MAX_LUXELS_PER_FACE) {
+                continue;
+            }
+
+            aaTargets[index] = 0;
+        }
+
+        __syncthreads();
+
+        /* Select luxels on this face that are good candidates for AA. */
         for (size_t i=0; i<height; i+=blockDim.y) {
             size_t t = i + threadIdx.y;
 
@@ -565,105 +419,138 @@ namespace AA {
                     }
                 }
 
-                /*
-                * Don't bother antialiasing this sample if the gradient is
-                * low enough.
-                */
-                if (gradient < MIN_AA_GRADIENT) {
-                    //results[sampleIndex] = sampleColor;
-                    continue;
-                }
-
-                ///*
-                // * Box blur!
-                // * Really stupid and potentially ugly, but really fast!
-                // */
-
-                //float3 color = make_float3(0.0, 0.0, 0.0);
-
-                //for (int tOffset=-1; tOffset<=1; tOffset++) {
-                //    float blurT = static_cast<float>(t) + tOffset;
-
-                //    for (int sOffset=-1; sOffset<=1; sOffset++) {
-                //        float blurS = static_cast<float>(s) + sOffset;
-
-                //        float3 blurColor;
-
-                //        /*
-                //         * Out of range!
-                //         * We have no choice but to actually take a sample.
-                //         */
-                //        if (!(0 <= blurS && blurS < width)
-                //                || !(0 <= blurT && blurT < height)) {
-                //            blurColor = sample_at(
-                //                *pCudaBSP, faceInfo,
-                //                blurS, blurT
-                //            );
-                //        }
-                //        else {
-                //            size_t i = static_cast<size_t>(
-                //                blurT * width + blurS
-                //            );
-                //            blurColor = pCudaBSP->lightSamples[
-                //                lightmapStart + i
-                //            ];
-                //        }
-
-                //        color += blurColor;
-                //    }
-                //}
-
-                ///* Take the average of the box blur samples. */
-                //color /= 9.0;
-
-                /* Perform supersampling at this point. */
-                const size_t SUPERSAMPLE_WIDTH = 4;
-
-                float sStep = 2.0 / static_cast<float>(SUPERSAMPLE_WIDTH);
-                float tStep = 2.0 / static_cast<float>(SUPERSAMPLE_WIDTH);
-
-                float3 color = make_float3(0.0, 0.0, 0.0);
-
-                for (size_t ssi=0; ssi<SUPERSAMPLE_WIDTH; ssi++) {
-                    float tOffset = tStep * ssi - 1.0;
-
-                    for (size_t ssj=0; ssj<SUPERSAMPLE_WIDTH; ssj++) {
-                        float sOffset = sStep * ssj - 1.0;
-
-                        color += DirectLighting::sample_at(
-                            *pCudaBSP, faceInfo,
-                            s + sOffset, t + tOffset
-                        );
-                    }
-                }
-
-                color /= SUPERSAMPLE_WIDTH * SUPERSAMPLE_WIDTH;
-
-                //results[sampleIndex] = color;
-                pCudaBSP->lightSamples[lightmapStart + sampleIndex] = color;
+                assert(sampleIndex < CUDABSP::MAX_LUXELS_PER_FACE);
+                aaTargets[sampleIndex] = (gradient > MIN_AA_GRADIENT);
             }
         }
 
-        //__syncthreads();
+        __syncthreads();
 
-        //if (primaryThread) {
-        //    /* Move the results back to the light samples array. */
-        //    memcpy(
-        //        pCudaBSP->lightSamples + faceInfo.lightmapStartIndex,
-        //        results,
-        //        sizeof(float3) * faceInfo.lightmapSize
-        //    );
+        __shared__ uint32_t scannedAATargets[CUDABSP::MAX_LUXELS_PER_FACE];
 
-        //    delete[] results;
-        //}
+        prefix_sum<
+            uint32_t, CUDABSP::MAX_LUXELS_PER_FACE,
+            MAP_FACES_AA_BLOCK_WIDTH, MAP_FACES_AA_BLOCK_HEIGHT
+        >(aaTargets, scannedAATargets);
+
+        __syncthreads();
+
+        __shared__ size_t numAATargets;
+        __shared__ uint32_t aaTargetIndices[CUDABSP::MAX_LUXELS_PER_FACE];
+
+        if (primaryThread) {
+            numAATargets =
+                scannedAATargets[CUDABSP::MAX_LUXELS_PER_FACE - 1]
+                + aaTargets[CUDABSP::MAX_LUXELS_PER_FACE - 1];
+        }
+
+        __syncthreads();
+
+        /* Gather all the AA targets into the final target array. */
+        for (size_t i=0; i<CUDABSP::MAX_LUXELS_PER_FACE; i+=threadsPerBlock) {
+            size_t index = i + threadID;
+            if (index >= CUDABSP::MAX_LUXELS_PER_FACE) {
+                continue;
+            }
+
+            if (aaTargets[index]) {
+                size_t finalPosition = scannedAATargets[index];
+                aaTargetIndices[finalPosition] = index;
+            }
+        }
+
+        __syncthreads();
+
+        __shared__ float3 finalSamples[CUDABSP::MAX_LUXELS_PER_FACE];
+
+        /* Zero out all the final samples. */
+        for (size_t i=0; i<numAATargets; i+=threadsPerBlock) {
+            size_t index = i + threadID;
+            if (index >= numAATargets) {
+                continue;
+            }
+
+            finalSamples[index] = make_float3();
+        }
+
+        __syncthreads();
+
+        const size_t SUPERSAMPLE_WIDTH = 4;
+        const size_t SUPERSAMPLES_PER_TARGET =
+            SUPERSAMPLE_WIDTH * SUPERSAMPLE_WIDTH;
+
+        const size_t numSupersamples = numAATargets * SUPERSAMPLES_PER_TARGET;
+
+        /* Supersample all the target positions. */
+        for (size_t i=0; i<numSupersamples; i+=threadsPerBlock) {
+            size_t index = i + threadID;
+            if (index >= numSupersamples) {
+                continue;
+            }
+
+            size_t aaTargetNumber = index / SUPERSAMPLES_PER_TARGET;
+            size_t targetSupersampleNumber = index % SUPERSAMPLES_PER_TARGET;
+
+            size_t aaTargetIndex = aaTargetIndices[aaTargetNumber];
+
+            float s = static_cast<float>(aaTargetIndex % width);
+            float t = static_cast<float>(aaTargetIndex / width);
+
+            size_t sOffsetIndex = targetSupersampleNumber % SUPERSAMPLE_WIDTH;
+            size_t tOffsetIndex = targetSupersampleNumber / SUPERSAMPLE_WIDTH;
+
+            float sStep = 2.0f / static_cast<float>(SUPERSAMPLE_WIDTH);
+            float tStep = 2.0f / static_cast<float>(SUPERSAMPLE_WIDTH);
+
+            float sOffset = sStep * sOffsetIndex - 1.0f;
+            float tOffset = tStep * tOffsetIndex - 1.0f;
+
+            float3 color = DirectLighting::sample_at(
+                *pCudaBSP, faceInfo,
+                s + sOffset, t + tOffset
+            );
+
+            float3& sample = finalSamples[aaTargetNumber];
+
+            atomicAdd(&sample.x, color.x);
+            atomicAdd(&sample.y, color.y);
+            atomicAdd(&sample.z, color.z);
+        }
+
+        __threadfence_block();
+        __syncthreads();
+
+        /* Average out all the supersamples. */
+        for (size_t i=0; i<numAATargets; i+=threadsPerBlock) {
+            size_t index = i + threadID;
+            if (index >= numAATargets) {
+                continue;
+            }
+
+            finalSamples[index] /= SUPERSAMPLES_PER_TARGET;
+        }
+
+        __syncthreads();
+
+        /* Scatter the final samples to their lightmap positions. */
+        for (size_t i=0; i<numAATargets; i+=threadsPerBlock) {
+            size_t index = i + threadID;
+            if (index >= numAATargets) {
+                continue;
+            }
+
+            size_t targetIndex = aaTargetIndices[index];
+            size_t lightmapIndex = lightmapStart + targetIndex;
+
+            pCudaBSP->lightSamples[lightmapIndex] = finalSamples[index];
+        }
     }
 }
 
 
 namespace BouncedLighting {
-    static __device__ const float PI = 3.14159265358979323846264;
-    static __device__ const float INV_PI = 0.31830988618379067153715;
-
+    static __device__ const float PI = 3.14159265358979323846264f;
+    static __device__ const float INV_PI = 0.31830988618379067153715f;
 
     /**
      * Computes the form factor from a differential patch to a convex
@@ -682,7 +569,7 @@ namespace BouncedLighting {
             float3* vertices, size_t numVertices
             ) {
 
-        float result = 0.0;
+        float result = 0.0f;
 
         for (size_t i=0; i<4; i++) {
             float3 vertex1 = vertices[i] - diffPos;
@@ -700,7 +587,7 @@ namespace BouncedLighting {
             result += dot(diffNorm, vertexCross) * theta;
         }
 
-        result *= 0.5 * INV_PI;
+        result *= 0.5f * INV_PI;
 
         return result;
     }
@@ -713,7 +600,7 @@ namespace BouncedLighting {
             ) {
 
         float3 delta = diff2Pos - diff1Pos;
-        float invDist = 1.0 / len(delta);
+        float invDist = 1.0f / len(delta);
 
         float3 dir = delta * invDist;
 
@@ -726,7 +613,7 @@ namespace BouncedLighting {
 
 
 namespace AmbientLighting {
-    static __device__ const float AMBIENT_SCALE = 0.0078125;    // 1/128
+    static __device__ const float AMBIENT_SCALE = 1.0f / 128.0f;
 
     __global__ void map_leaves(CUDABSP::CUDABSP* pCudaBSP) {
         size_t leafIndex = blockIdx.x;
@@ -768,9 +655,9 @@ namespace AmbientLighting {
             float3 leafSize = leafMaxs - leafMins;
 
             float3 samplePos = leafMins + make_float3(
-                leafSize.x * static_cast<float>(sample.x) / 255.0,
-                leafSize.y * static_cast<float>(sample.y) / 255.0,
-                leafSize.z * static_cast<float>(sample.z) / 255.0
+                leafSize.x * static_cast<float>(sample.x) / 255.0f,
+                leafSize.y * static_cast<float>(sample.y) / 255.0f,
+                leafSize.z * static_cast<float>(sample.z) / 255.0f
             );
 
             //sample.cube.color[0] = BSP::RGBExp32 {1, 1, 1, -3};
@@ -780,12 +667,20 @@ namespace AmbientLighting {
             //sample.cube.color[4] = BSP::RGBExp32 {1, 1, 1, -3};
             //sample.cube.color[5] = BSP::RGBExp32 {1, 1, 1, -3};
 
+            /*
+             * Note: This isn't really the correct way to do ambient lighting.
+             * Actual ambient lighting would sample lightmaps visible from this
+             * point in a sphere, and use that information to accumulate
+             * lighting data into a light cube.
+             * TODO: Write an actual ambient lighting algorithm.
+             */
+
             // +X
             sample.cube.color[0] = CUDABSP::rgbexp32_from_float3(
                 DirectLighting::sample_at(
                     *pCudaBSP,
                     samplePos,
-                    make_float3(1.0, 0.0, 0.0)
+                    make_float3(1.0f, 0.0f, 0.0f)
                 ) * AMBIENT_SCALE
             );
 
@@ -794,7 +689,7 @@ namespace AmbientLighting {
                 DirectLighting::sample_at(
                     *pCudaBSP,
                     samplePos,
-                    make_float3(-1.0, 0.0, 0.0)
+                    make_float3(-1.0f, 0.0f, 0.0f)
                 ) * AMBIENT_SCALE
             );
 
@@ -803,7 +698,7 @@ namespace AmbientLighting {
                 DirectLighting::sample_at(
                     *pCudaBSP,
                     samplePos,
-                    make_float3(0.0, 1.0, 0.0)
+                    make_float3(0.0f, 1.0f, 0.0f)
                 ) * AMBIENT_SCALE
             );
 
@@ -812,7 +707,7 @@ namespace AmbientLighting {
                 DirectLighting::sample_at(
                     *pCudaBSP,
                     samplePos,
-                    make_float3(0.0, -1.0, 0.0)
+                    make_float3(0.0f, -1.0f, 0.0f)
                 ) * AMBIENT_SCALE
             );
 
@@ -821,7 +716,7 @@ namespace AmbientLighting {
                 DirectLighting::sample_at(
                     *pCudaBSP,
                     samplePos,
-                    make_float3(0.0, 0.0, 1.0)
+                    make_float3(0.0f, 0.0f, 1.0f)
                 ) * AMBIENT_SCALE
             );
 
@@ -830,7 +725,7 @@ namespace AmbientLighting {
                 DirectLighting::sample_at(
                     *pCudaBSP,
                     samplePos,
-                    make_float3(0.0, 0.0, -1.0)
+                    make_float3(0.0f, 0.0f, -1.0f)
                 ) * AMBIENT_SCALE
             );
         }
@@ -875,9 +770,9 @@ namespace CUDARAD {
 
                 RayTracer::Triangle tri {
                     {
-                        make_float3(vertex1.x, vertex1.y, vertex1.z),
-                        make_float3(vertex2.x, vertex2.y, vertex2.z),
-                        make_float3(vertex3.x, vertex3.y, vertex3.z),
+                        make_float3(vertex1),
+                        make_float3(vertex2),
+                        make_float3(vertex3),
                     },
                 };
 
@@ -1024,145 +919,18 @@ namespace CUDARAD {
 
         CUDA_CHECK_ERROR(cudaEventRecord(startEvent));
 
-        size_t numSamples = bsp.get_lightsamples().size();
+        size_t numFaces = bsp.get_faces().size();
 
-        int* facesForSamples;
-
-        CUDA_CHECK_ERROR(
-            cudaMalloc(&facesForSamples, sizeof(int) * numSamples)
+        dim3 blockDim(
+            AA::MAP_FACES_AA_BLOCK_WIDTH,
+            AA::MAP_FACES_AA_BLOCK_HEIGHT
         );
-        CUDA_CHECK_ERROR(
-            cudaMemset(facesForSamples, -1, sizeof(int) * numSamples)
-        );
-
-        int2* coordsForSamples;
-
-        CUDA_CHECK_ERROR(
-            cudaMalloc(&coordsForSamples, sizeof(int2) * numSamples)
-        );
-        CUDA_CHECK_ERROR(
-            cudaMemset(coordsForSamples, -1, sizeof(int2) * numSamples)
-        );
-
-        int* targets;
-        CUDA_CHECK_ERROR(cudaMalloc(&targets, sizeof(int) * numSamples));
-        CUDA_CHECK_ERROR(cudaMemset(targets, 0, sizeof(int) * numSamples));
-
-        size_t blockWidth = 1024;
-        size_t numBlocks = div_ceil(bsp.get_faces().size(), blockWidth);
 
         KERNEL_LAUNCH(
-            AA::map_face_samples,
-            numBlocks, blockWidth,
-            pCudaBSP,
-            facesForSamples, coordsForSamples
+            AA::map_faces_AA,
+            numFaces, blockDim,
+            pCudaBSP
         );
-
-        numBlocks = div_ceil(numSamples, blockWidth);
-
-        KERNEL_LAUNCH(
-            AA::map_select_targets,
-            numBlocks, blockWidth,
-            pCudaBSP,
-            facesForSamples, coordsForSamples,
-            targets
-        );
-
-        CUDA_CHECK_ERROR(cudaDeviceSynchronize());
-
-        int* targetsScanned;
-        CUDA_CHECK_ERROR(
-            cudaMalloc(&targetsScanned, sizeof(int) * numSamples)
-        );
-
-        void* dTempStorage = nullptr;
-        size_t tempStorageSize = 0;
-        cub::DeviceScan::InclusiveSum(
-            dTempStorage, tempStorageSize,
-            targets, targetsScanned,
-            numSamples
-        );
-
-        CUDA_CHECK_ERROR(cudaMalloc(&dTempStorage, tempStorageSize));
-
-        cub::DeviceScan::InclusiveSum(
-            dTempStorage, tempStorageSize,
-            targets, targetsScanned,
-            numSamples
-        );
-
-        CUDA_CHECK_ERROR(cudaFree(dTempStorage));
-
-        int numTargets;
-        CUDA_CHECK_ERROR(
-            cudaMemcpy(
-                &numTargets, &targetsScanned[numSamples - 1], sizeof(int),
-                cudaMemcpyDeviceToHost
-            )
-        );
-
-        if (numTargets <= 0) {
-            // TODO: Free all cudaMalloc()'d memory!
-            return;
-        }
-
-        std::cout << "numTargets: " << numTargets << std::endl;
-
-        int2* finalCoords;
-        CUDA_CHECK_ERROR(
-            cudaMalloc(&finalCoords, sizeof(int2) * numTargets)
-        );
-
-        int* finalFacesForCoords;
-        CUDA_CHECK_ERROR(
-            cudaMalloc(&finalFacesForCoords, sizeof(int) * numTargets)
-        );
-
-        blockWidth = 32;
-        numBlocks = div_ceil(numSamples, blockWidth);
-
-        KERNEL_LAUNCH(
-            AA::gather_target_coords,
-            numBlocks, blockWidth,
-            pCudaBSP,
-            finalCoords, finalFacesForCoords,
-            coordsForSamples, facesForSamples,
-            targetsScanned, targets
-        );
-
-        numBlocks = div_ceil(numTargets, blockWidth);
-
-        std::cout << "numBlocks: " << numBlocks << std::endl;
-
-        KERNEL_LAUNCH(
-            AA::antialias_coords,
-            numBlocks, blockWidth,
-            pCudaBSP,
-            finalCoords, finalFacesForCoords,
-            static_cast<size_t>(numTargets)
-        );
-
-        CUDA_CHECK_ERROR(cudaDeviceSynchronize());
-
-        CUDA_CHECK_ERROR(cudaFree(finalFacesForCoords));
-        CUDA_CHECK_ERROR(cudaFree(finalCoords));
-        CUDA_CHECK_ERROR(cudaFree(targetsScanned));
-        CUDA_CHECK_ERROR(cudaFree(targets));
-        CUDA_CHECK_ERROR(cudaFree(coordsForSamples));
-        CUDA_CHECK_ERROR(cudaFree(facesForSamples));
-
-        //const size_t BLOCK_WIDTH = 16;
-        //const size_t BLOCK_HEIGHT = 16;
-
-        //size_t numFaces = bsp.get_faces().size();
-
-        //dim3 blockDim(BLOCK_WIDTH, BLOCK_HEIGHT);
-
-        //KERNEL_LAUNCH(
-        //    DirectLighting::map_faces_AA,
-        //    numFaces, blockDim,
-        //    pCudaBSP
-        //);
 
         CUDA_CHECK_ERROR(cudaEventRecord(stopEvent));
 
@@ -1194,7 +962,7 @@ namespace CUDARAD {
         auto start = Clock::now();
 
         const size_t BLOCK_WIDTH = 32;
-        
+
         size_t numLeaves;
 
         CUDA_CHECK_ERROR(
@@ -1203,7 +971,7 @@ namespace CUDARAD {
                 cudaMemcpyDeviceToHost
             )
         );
-        
+
         KERNEL_LAUNCH(
             AmbientLighting::map_leaves,
             numLeaves, BLOCK_WIDTH,
